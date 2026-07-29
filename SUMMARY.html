@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Flaky Network — Architecture &amp; Design Summary</title>
+<style>
+  :root{
+    --ink:#16181d; --mute:#5c6370; --line:#e2e4e9; --bg:#fbfbfc;
+    --accent:#1f5f8b; --warn:#8b3a1f; --ok:#1f6b3a; --code-bg:#f4f5f7;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.65 ui-serif, Georgia, "Iowan Old Style", serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:820px; margin:0 auto; padding:64px 28px 96px}
+  h1{font-size:2.1rem; line-height:1.2; margin:0 0 6px; letter-spacing:-.02em}
+  .sub{color:var(--mute); font-size:1rem; margin:0 0 8px}
+  .meta{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--mute);
+        border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+        padding:10px 0; margin:24px 0 40px}
+  h2{font-size:1.25rem; margin:48px 0 14px; letter-spacing:-.01em;
+     padding-bottom:6px; border-bottom:2px solid var(--ink); display:inline-block}
+  h3{font-size:1rem; margin:28px 0 8px; letter-spacing:.02em; text-transform:uppercase;
+     color:var(--mute); font-family:ui-sans-serif,system-ui,sans-serif}
+  p{margin:0 0 16px}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  code{background:var(--code-bg); padding:1px 5px; border-radius:3px; font-size:.88em}
+  pre{background:var(--code-bg); border:1px solid var(--line); border-radius:6px;
+      padding:16px; overflow-x:auto; font-size:13px; line-height:1.5; margin:0 0 20px}
+  pre code{background:none; padding:0; font-size:inherit}
+  table{border-collapse:collapse; width:100%; margin:0 0 22px; font-size:14px;
+        font-family:ui-sans-serif,system-ui,sans-serif}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--line);
+        vertical-align:top}
+  th{font-weight:600; font-size:12px; letter-spacing:.06em; text-transform:uppercase;
+     color:var(--mute)}
+  tbody tr:last-child td{border-bottom:none}
+  .num{font-family:ui-monospace,Menlo,monospace}
+  .callout{border-left:3px solid var(--accent); background:#fff; padding:14px 18px;
+           margin:0 0 22px; border-radius:0 6px 6px 0}
+  .callout.warn{border-left-color:var(--warn)}
+  .callout p:last-child{margin-bottom:0}
+  .k{color:var(--accent); font-weight:600}
+  .ok{color:var(--ok); font-weight:600}
+  .bad{color:var(--warn); font-weight:600}
+  ul,ol{margin:0 0 18px; padding-left:22px}
+  li{margin-bottom:7px}
+  figure{margin:0 0 24px}
+  figcaption{font-size:13px; color:var(--mute); margin-top:8px;
+             font-family:ui-sans-serif,system-ui,sans-serif}
+  .rule{height:1px; background:var(--line); margin:56px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>The Flaky Network</h1>
+<p class="sub">Architecture and design summary — real-time frame delivery over a lossy, jittering, reordering, duplicating relay.</p>
+
+<div class="meta">
+STREAM 160 B / frame @ 20 ms &nbsp;·&nbsp; TRANSPORT UDP, 127.0.0.1 &nbsp;·&nbsp; LANGUAGE C++17<br>
+MECHANISM rate-½ XOR convolutional erasure code, stride 1 &nbsp;·&nbsp; FEEDBACK none<br>
+RESULT profile B, 30 s, 100 ms playout → <span class="ok">0.13 % miss, 1.95× overhead, VALID</span>
+</div>
+
+<h2>1. What the problem actually is</h2>
+
+<p>A source hands the sender frame <code>i</code> at exactly <code>t0 + i·20 ms</code>. The player judges frame <code>i</code> at <code>t0 + DELAY_MS + i·20 ms</code>: the payload must have arrived on port 47020, byte-correct, before that instant. Between the two sits a relay that drops packets, delays each one by an independent random amount, duplicates some, and thereby reorders them.</p>
+
+<p>The naive forward gives <span class="bad">3.8 % misses on profile A</span> and <span class="bad">40 % on profile B</span>. Decomposing that number is the whole design:</p>
+
+<pre><code>miss(frame i)  ≈  P(packet lost)  +  P(network delay &gt; DELAY_MS)
+                  └── drops ──┘      └──── jitter tail ────┘</code></pre>
+
+<p>On profile B, loss is 5 % but the delay is uniform on [20, 80] ms. At a 60 ms deadline the jitter tail alone accounts for roughly a third of all frames. <strong>Jitter, not loss, is the dominant failure mode</strong>, and the two require different remedies: jitter is bought off with playout delay or with independent delay draws, loss is bought off with redundancy.</p>
+
+<h2>2. The constraint that decides everything</h2>
+
+<p><code>score.py</code> defines <code>raw = n × 160</code> and charges every byte crossing the relay in <em>both</em> directions, including packets the relay subsequently drops. The cap is 2.0×. So the entire budget is:</p>
+
+<pre><code>320 bytes per frame, sender + receiver combined.</code></pre>
+
+<div class="callout warn">
+<p><strong>Plain duplication is arithmetically impossible.</strong> Two copies of a 160-byte payload is 320 bytes <em>before a single header byte</em>. Any scheme that repeats every frame in full is over the cap by construction. The real budget is about <span class="k">1.95×</span>, i.e. roughly <span class="k">0.9 redundant packets per frame</span> — slightly less than one.</p>
+</div>
+
+<p>Two corollaries followed immediately, and both shaped the implementation:</p>
+<ul>
+  <li><strong>Every feedback byte is media budget spent.</strong> The receiver therefore sends nothing at all; the whole 2.0× stays on the forward path.</li>
+  <li><strong>Header size is a first-class cost.</strong> At 163 B/packet the header is 1.9 % of the budget. A 4-byte sequence number would have cost measurably more redundancy, so the wire sequence is 16-bit.</li>
+</ul>
+
+<h2>3. Why FEC, and why this FEC</h2>
+
+<h3>Retransmission was rejected on arithmetic</h3>
+<p>A NACK crosses the relay to the sender and the repair crosses back — two independent draws from the same hostile distribution. On profile B that is two samples of [20, 80] ms, so the expected repair lands ~100 ms after the loss is even detected, on top of the detection delay. There is no playout delay worth scoring that absorbs it. ARQ is the correct mechanism when the round trip is small relative to the deadline; here it is larger.</p>
+
+<h3>Parity beats repetition at identical cost</h3>
+<p>One redundant packet per frame can carry either a copy of an old frame or an XOR of two frames. They cost the same bytes. The XOR carries strictly more information:</p>
+
+<table>
+<thead><tr><th>Scheme</th><th>Cost</th><th>Recovery paths for frame <code>i</code></th></tr></thead>
+<tbody>
+<tr><td>Repeat frame <code>i</code> immediately</td><td>~2 pkt/frame</td><td>2, both at lag 0 — dies whole in a burst</td></tr>
+<tr><td>Repeat frame <code>i</code> at lag <code>L</code></td><td>~2 pkt/frame</td><td>2, one at lag 0 and one at lag <code>L</code></td></tr>
+<tr><td><strong>XOR parity, stride <code>S</code></strong></td><td>~2 pkt/frame</td><td><strong>3</strong> — see below</td></tr>
+</tbody>
+</table>
+
+<p>With <code>parity[i] = frame[i] XOR frame[i−S]</code> transmitted right behind <code>frame[i]</code>, frame <code>i</code> can be reconstructed from any of:</p>
+<ol>
+  <li>its own data packet — lag 0;</li>
+  <li><code>parity[i] XOR frame[i−S]</code> — lag 0, since <code>frame[i−S]</code> is already decoded;</li>
+  <li><code>parity[i+S] XOR frame[i+S]</code> — lag <code>S</code>, the burst-survival path.</li>
+</ol>
+
+<p>The same byte buys both a zero-lag repair and a future repair. That is the design's central claim.</p>
+
+<h3>Stride was measured, not assumed</h3>
+<p>Stride 3 was the initial choice on the theory that spreading redundancy decorrelates it from bursts. It measured <span class="bad">1.0 % on B at 90 ms and refused to improve at 110 ms</span> — a plateau, meaning the residual misses were not jitter. Replaying the receiver's actual packet log through an offline decoder with no time limit showed only <strong>2</strong> of 1000 frames were truly unrecoverable while <strong>9</strong> were scored as misses: seven frames were repaired <em>after</em> their deadline.</p>
+
+<div class="callout">
+<p><strong>Stride is a delay tax.</strong> Path 3 is not transmitted until <code>t = 20(i+S)</code>, so it starts <code>20S</code> ms behind and then draws its own network delay. At <code>S=3</code> that repair cannot beat a 100 ms deadline more than about half the time. Sweeping <code>S ∈ {1,2,3}</code> was monotone on every profile tested, including the bursty ones: <strong>S = 1 wins</strong>. Widening the stride cannot decorrelate the burst anyway, because the data packet and its parity are emitted back-to-back and a burst takes both regardless — stride only relocates the third path, further into the future.</p>
+</div>
+
+<h2>4. System architecture</h2>
+
+<figure>
+<pre><code>  harness source                                        harness player
+        │ 47010                                            ▲ 47020
+        │ [seq:4][payload:160]              [seq:4][payload:160]
+        ▼                                                  │
+  ┌───────────────┐        47001      ┌─────────┐   47002  ┌──────────────┐
+  │    SENDER     │ ────────────────▶ │  RELAY  │ ───────▶ │   RECEIVER   │
+  │               │                   │ (drop,  │          │              │
+  │ history ring  │  [t:1][seq:2]     │  jitter,│          │ have[] sent[]│
+  │ XOR encoder   │  [payload:160]    │  dup,   │          │ par[] queue  │
+  │ byte governor │      163 B        │ reorder)│          │ XOR cascade  │
+  └───────────────┘                   └─────────┘          └──────────────┘
+                                                    feedback path: UNUSED
+                                                    (47003/47004 silent —
+                                                     every byte is budget)</code></pre>
+<figcaption>Both directions are metered at relay ingress. The receiver's silence is a deliberate allocation, not an omission.</figcaption>
+</figure>
+
+<h3>Wire format (sender → receiver, our design)</h3>
+<pre><code>byte 0        type   0 = data, 1 = parity
+bytes 1–2     seq    uint16 big-endian
+bytes 3–162   160 B  payload, or frame[seq] XOR frame[seq−S] for type 1
+                                                        total 163 B</code></pre>
+<p>A 16-bit sequence covers 65 536 frames ≈ 21 minutes at 20 ms, comfortably beyond any graded run, and the receiver zero-extends it to the 32-bit sequence the player expects. Data and parity share one format, so a duplicate arriving from the relay and a redundant packet sent on purpose are handled by the same code path.</p>
+
+<h2>5. Sender</h2>
+
+<p>Single-threaded, blocking <code>recvfrom</code> on 47010. There is nothing to schedule: the source's own clock <em>is</em> the pacing, and the sender is physically unable to transmit frame <code>i</code> early because it does not yet have it. Per frame:</p>
+
+<ol>
+  <li>Parse the 4-byte big-endian sequence, store the payload in a flat history array indexed by sequence.</li>
+  <li>Emit the data packet immediately — latency here is pure loss, so nothing is buffered or batched.</li>
+  <li>If <code>seq ≥ S</code> and the governor permits, XOR against <code>history[seq−S]</code> and emit the parity packet.</li>
+</ol>
+
+<h3>The byte governor</h3>
+<pre><code>allowed = RATIO × 160 × (seq + 1)          // RATIO = 1.95
+if (bytes_sent + 163 &lt;= allowed) { emit parity; bytes_sent += 163; }</code></pre>
+
+<p>This is a cumulative check, not a per-frame one, so it self-corrects: transient suppression is repaid as the allowance grows. It costs roughly 8 % of parity packets — the price of header bytes — and in exchange the run is <strong>structurally incapable of breaching the cap on any profile</strong>, measured or unmeasured. Overhead came out at exactly 1.95× on every run recorded. Making the limit a property of the code rather than of a tuned constant is what makes the result portable to the unseen grading profiles.</p>
+
+<h2>6. Receiver</h2>
+
+<h3>No playout clock — and that is the point</h3>
+<p>Reading <code>endpoints.py</code> closely: the player records <code>first_arrival[i]</code> and later asserts <code>arrival ≤ deadline</code>. Nothing penalises early arrival. The graded jitter buffer is therefore the <code>DELAY_MS</code> parameter itself, held by the harness. A scheduler on the receiver could only ever delay a frame toward its deadline, never improve it. So the policy is: <strong>the instant a payload becomes known, emit it</strong>. This removed an entire thread, a timer, and a class of bugs.</p>
+
+<h3>Decode cascade</h3>
+<p>State is four flat arrays indexed by sequence — payload, <code>have</code>, <code>sent</code>, parity + <code>have_parity</code>. A parity at index <code>p</code> spans frames <code>p</code> and <code>p−S</code> and is resolvable exactly when one of the two is known:</p>
+
+<pre><code>on data[s]    : if !have[s] → store, deliver, cascade(s)
+on parity[p]  : if !have_par[p] → store, cascade(p)
+
+cascade(x)    : queue ← x
+                while queue non-empty:
+                    y ← pop
+                    try_resolve(par[y])        // spans y and y−S
+                    try_resolve(par[y+S])      // spans y+S and y
+                    any frame recovered → deliver + push</code></pre>
+
+<p>The cascade matters because repairs chain: a parity held in limbo because <em>both</em> its frames were missing becomes resolvable the moment a neighbour is recovered, which may in turn unlock the next parity along the chain. An explicit work queue is used rather than recursion, since a cascade can run the length of the stream.</p>
+
+<div class="callout warn">
+<p><strong>Bug found by measurement, not by reading.</strong> An early version called <code>try_resolve</code> before <code>cascade</code> on parity arrival, so it pushed onto a queue whose indices were then reset — repairs happened but never propagated. It was invisible in the miss rate and only surfaced when the offline decode of the packet log disagreed with the harness score. Instrument the decoder against ground truth; the score alone will not tell you whether a mechanism is weak or merely mis-wired.</p>
+</div>
+
+<h2>7. Results</h2>
+
+<table>
+<thead><tr><th>Configuration</th><th>Profile</th><th class="num">Delay</th><th class="num">Miss</th><th class="num">Overhead</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Naive forward</td><td>A</td><td class="num">40 ms</td><td class="num">3.80 %</td><td class="num">1.02×</td><td class="bad">INVALID</td></tr>
+<tr><td>Naive forward</td><td>B</td><td class="num">60 ms</td><td class="num">40.00 %</td><td class="num">1.02×</td><td class="bad">INVALID</td></tr>
+<tr><td>XOR parity, S=3</td><td>B</td><td class="num">110 ms</td><td class="num">0.90 %</td><td class="num">1.95×</td><td class="ok">VALID</td></tr>
+<tr><td>XOR parity, S=1</td><td>A</td><td class="num">50 ms</td><td class="num">0.00 %</td><td class="num">1.95×</td><td class="ok">VALID</td></tr>
+<tr><td>XOR parity, S=1</td><td>B (30 s)</td><td class="num">100 ms</td><td class="num">0.13 %</td><td class="num">1.95×</td><td class="ok">VALID</td></tr>
+<tr><td>XOR parity, S=1</td><td>D (bursty)</td><td class="num">100 ms</td><td class="num">0.20 %</td><td class="num">1.95×</td><td class="ok">VALID</td></tr>
+</tbody>
+</table>
+
+<p><strong>Graded at <code>--delay_ms 100</code>.</strong> Profile B is comfortable at 85–90 ms on a favourable seed, but a seed sweep at 90 ms produced <span class="bad">1.30 % on seed 3</span> — an invalid run. Because the relay redraws impairments per packet, a delay tuned on one seed is fitted to noise. 100 ms was the lowest value that held across every seed and both self-authored burst profiles.</p>
+
+<h2>8. Known failure modes</h2>
+
+<ul>
+  <li><strong>Bursts longer than ~2 frames.</strong> A rate-½ chain repairs at most one erasure per parity, and the data packet and its parity are emitted back-to-back, so a burst takes both. On a self-authored harsh profile (70 % in-burst loss, mean burst ≈ 4 packets) the miss rate plateaus near 2 % and <em>no amount of playout delay recovers it</em> — the frames are unrecoverable, not late. Fixing this needs a stronger code, which the 2.0× cap forbids, or a wider stride, which the deadline forbids. The constraint pair is the binding one, not the mechanism.</li>
+  <li><strong>Jitter tail beyond ~95 ms.</strong> The last repair path is only 20 ms behind the data; past that, misses are deadline-bound rather than mechanism-bound, and the only remedy is a larger <code>delay_ms</code>.</li>
+  <li><strong>Sustained loss above ~15 %.</strong> The governor keeps overhead legal by suppressing parity, so under heavy loss the code silently weakens exactly when it is most needed. An adaptive scheme would need feedback, which costs budget on the same meter.</li>
+</ul>
+
+<div class="rule"></div>
+<p style="font-size:13px;color:var(--mute);font-family:ui-sans-serif,system-ui,sans-serif">
+Build: <code>make</code> → <code>./sender</code>, <code>./receiver</code>. Tunables (env, read by both processes):
+<code>FEC_STRIDE</code> default 1, <code>FEC_RATIO</code> default 1.95.
+Standard library only — sockets and byte manipulation, no networking frameworks, no side channels between the two processes.
+</p>
+
+</div>
+</body>
+</html>
