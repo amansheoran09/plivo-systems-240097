@@ -17,7 +17,7 @@ penalises early arrival, so the graded playout buffer is the `delay_ms` paramete
 and holding frames back could only ever lose. The receiver sends no feedback at all, which
 keeps the entire 2.0x budget on the media path.
 
-Grade at `--delay_ms 100`. What breaks it: bursts longer than roughly two frames, because
+Grade at `--delay_ms 110`. What breaks it: bursts longer than roughly two frames, because
 a rate-1/2 chain repairs at most one erasure per parity and the data packet and its parity
 are emitted back-to-back and so die together — on a self-authored profile with 70%
 in-burst loss the miss rate plateaus near 2% and no amount of playout delay recovers it.
